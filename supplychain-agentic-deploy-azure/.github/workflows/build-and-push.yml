@@ -1,0 +1,503 @@
+name: Build Push Deploy React + FastAPI to ACA
+
+on:
+  workflow_dispatch:
+    inputs:
+      subscription_id:
+        description: "Optional Azure subscription ID. Leave blank to use the default after device-code login."
+        required: false
+        default: ""
+      acr_name:
+        description: "Existing Azure Container Registry name"
+        required: true
+        default: "acrsupplyagenticdev"
+      resource_group:
+        description: "Existing Azure Resource Group that contains ACR and CAE"
+        required: true
+        default: "rg-supply-agentic-dev"
+      location:
+        description: "Azure region"
+        required: true
+        default: "germanywestcentral"
+      aca_env_name:
+        description: "Existing Container Apps Environment name"
+        required: true
+        default: "aca-supply-agentic-dev"
+      frontend_app_name:
+        description: "Frontend Container App name"
+        required: true
+        default: "ca-supply-frontend-dev"
+      backend_app_name:
+        description: "Backend Container App name"
+        required: true
+        default: "ca-supply-backend-dev"
+      db_user:
+        description: "Postgres user for the backend sidecar"
+        required: true
+        default: "supplyuser"
+      db_name:
+        description: "Postgres database name for the backend sidecar"
+        required: true
+        default: "supplychain"
+      db_password:
+        description: "Postgres password for the backend sidecar. This is masked in logs after the first workflow step."
+        required: true
+      secret_key:
+        description: "FastAPI/JWT secret key"
+        required: true
+        default: "change-me-dev-secret"
+      azure_openai_api_key:
+        description: "Azure OpenAI API key used by the agent backend"
+        required: true
+      azure_openai_endpoint:
+        description: "Azure OpenAI endpoint, for example https://my-resource.openai.azure.com/"
+        required: true
+      azure_openai_deployment:
+        description: "Azure OpenAI deployment name"
+        required: true
+      azure_openai_api_version:
+        description: "Azure OpenAI API version"
+        required: true
+        default: "2024-02-15-preview"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve variables and mask inputs
+        id: vars
+        shell: bash
+        env:
+          INPUT_ACR_NAME: ${{ inputs.acr_name }}
+          INPUT_RESOURCE_GROUP: ${{ inputs.resource_group }}
+          INPUT_LOCATION: ${{ inputs.location }}
+          INPUT_ACA_ENV_NAME: ${{ inputs.aca_env_name }}
+          INPUT_FRONTEND_APP: ${{ inputs.frontend_app_name }}
+          INPUT_BACKEND_APP: ${{ inputs.backend_app_name }}
+          INPUT_SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          INPUT_DB_USER: ${{ inputs.db_user }}
+          INPUT_DB_NAME: ${{ inputs.db_name }}
+          INPUT_DB_PASSWORD: ${{ inputs.db_password }}
+          INPUT_SECRET_KEY: ${{ inputs.secret_key }}
+          INPUT_AZURE_OPENAI_API_KEY: ${{ inputs.azure_openai_api_key }}
+          INPUT_AZURE_OPENAI_ENDPOINT: ${{ inputs.azure_openai_endpoint }}
+          INPUT_AZURE_OPENAI_DEPLOYMENT: ${{ inputs.azure_openai_deployment }}
+          INPUT_AZURE_OPENAI_API_VERSION: ${{ inputs.azure_openai_api_version }}
+        run: |
+          set -euo pipefail
+
+          ACR_NAME="$INPUT_ACR_NAME"
+          RESOURCE_GROUP="$INPUT_RESOURCE_GROUP"
+          LOCATION="$INPUT_LOCATION"
+          ACA_ENV_NAME="$INPUT_ACA_ENV_NAME"
+          FRONTEND_APP="$INPUT_FRONTEND_APP"
+          BACKEND_APP="$INPUT_BACKEND_APP"
+          SUBSCRIPTION_ID="$INPUT_SUBSCRIPTION_ID"
+
+          DB_USER="$INPUT_DB_USER"
+          DB_NAME="$INPUT_DB_NAME"
+          DB_PASSWORD="$INPUT_DB_PASSWORD"
+          SECRET_KEY="$INPUT_SECRET_KEY"
+          AZURE_OPENAI_API_KEY="$INPUT_AZURE_OPENAI_API_KEY"
+          AZURE_OPENAI_ENDPOINT="$INPUT_AZURE_OPENAI_ENDPOINT"
+          AZURE_OPENAI_DEPLOYMENT="$INPUT_AZURE_OPENAI_DEPLOYMENT"
+          AZURE_OPENAI_API_VERSION="$INPUT_AZURE_OPENAI_API_VERSION"
+
+          echo "::add-mask::$DB_PASSWORD"
+          echo "::add-mask::$SECRET_KEY"
+          echo "::add-mask::$AZURE_OPENAI_API_KEY"
+
+          DATABASE_URL=$(DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" DB_NAME="$DB_NAME" python3 - <<'PY'
+          import os
+          from urllib.parse import quote
+
+          user = quote(os.environ["DB_USER"], safe="")
+          password = quote(os.environ["DB_PASSWORD"], safe="")
+          db_name = quote(os.environ["DB_NAME"], safe="")
+          print(f"postgresql+psycopg2://{user}:{password}@127.0.0.1:5432/{db_name}")
+          PY
+          )
+          echo "::add-mask::$DATABASE_URL"
+
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          IMAGE_TAG="v$(date +'%Y.%m.%d').${SHORT_SHA}"
+          BACKEND_IMAGE="$ACR_NAME.azurecr.io/supplychain-backend:$IMAGE_TAG"
+          FRONTEND_IMAGE="$ACR_NAME.azurecr.io/supplychain-frontend:$IMAGE_TAG"
+
+          add_env() {
+            local name="$1"
+            local value="$2"
+            {
+              echo "$name<<EOF_$name"
+              echo "$value"
+              echo "EOF_$name"
+            } >> "$GITHUB_ENV"
+          }
+
+          add_env DB_USER "$DB_USER"
+          add_env DB_NAME "$DB_NAME"
+          add_env DB_PASSWORD "$DB_PASSWORD"
+          add_env DATABASE_URL "$DATABASE_URL"
+          add_env SECRET_KEY "$SECRET_KEY"
+          add_env AZURE_OPENAI_API_KEY "$AZURE_OPENAI_API_KEY"
+          add_env AZURE_OPENAI_ENDPOINT "$AZURE_OPENAI_ENDPOINT"
+          add_env AZURE_OPENAI_DEPLOYMENT "$AZURE_OPENAI_DEPLOYMENT"
+          add_env AZURE_OPENAI_API_VERSION "$AZURE_OPENAI_API_VERSION"
+
+          echo "acr_name=$ACR_NAME" >> "$GITHUB_OUTPUT"
+          echo "resource_group=$RESOURCE_GROUP" >> "$GITHUB_OUTPUT"
+          echo "location=$LOCATION" >> "$GITHUB_OUTPUT"
+          echo "aca_env_name=$ACA_ENV_NAME" >> "$GITHUB_OUTPUT"
+          echo "frontend_app=$FRONTEND_APP" >> "$GITHUB_OUTPUT"
+          echo "backend_app=$BACKEND_APP" >> "$GITHUB_OUTPUT"
+          echo "subscription_id=$SUBSCRIPTION_ID" >> "$GITHUB_OUTPUT"
+          echo "backend_image=$BACKEND_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=$FRONTEND_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login with device code
+        shell: bash
+        run: |
+          set -euo pipefail
+          az config set core.login_experience_v2=off
+          az login --use-device-code
+          if [ -n "${{ steps.vars.outputs.subscription_id }}" ]; then
+            az account set --subscription "${{ steps.vars.outputs.subscription_id }}"
+          fi
+          az account show --query "{subscription:id, tenant:tenantId, user:user.name}" -o table
+
+      - name: Ensure ACA extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          az extension add --name containerapp --upgrade --allow-preview true
+
+      - name: Verify existing Azure resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          az group show --name "${{ steps.vars.outputs.resource_group }}" >/dev/null
+          az acr show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null
+          az containerapp env show \
+            --name "${{ steps.vars.outputs.aca_env_name }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null
+
+      - name: Ensure ACR admin credentials are enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          ADMIN_ENABLED=$(az acr show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --query adminUserEnabled -o tsv)
+
+          if [ "$ADMIN_ENABLED" != "true" ]; then
+            az acr update \
+              --name "${{ steps.vars.outputs.acr_name }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --admin-enabled true >/dev/null
+          fi
+
+      - name: ACR login
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr login --name "${{ steps.vars.outputs.acr_name }}"
+
+      - name: Build and push backend image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t "${{ steps.vars.outputs.backend_image }}" ./backend
+          docker push "${{ steps.vars.outputs.backend_image }}"
+
+      - name: Build and push frontend image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t "${{ steps.vars.outputs.frontend_image }}" ./frontend
+          docker push "${{ steps.vars.outputs.frontend_image }}"
+
+      - name: Get ACR credentials for ACA pulls
+        id: acrcreds
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACR_USERNAME=$(az acr credential show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --query username -o tsv)
+
+          ACR_PASSWORD=$(az acr credential show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --query 'passwords[0].value' -o tsv)
+
+          echo "::add-mask::$ACR_PASSWORD"
+          echo "username=$ACR_USERNAME" >> "$GITHUB_OUTPUT"
+          echo "password=$ACR_PASSWORD" >> "$GITHUB_OUTPUT"
+
+      - name: Create backend ACA definition
+        shell: bash
+        env:
+          SUBSCRIPTION_ID_INPUT: ${{ steps.vars.outputs.subscription_id }}
+          RESOURCE_GROUP: ${{ steps.vars.outputs.resource_group }}
+          LOCATION: ${{ steps.vars.outputs.location }}
+          ACA_ENV_NAME: ${{ steps.vars.outputs.aca_env_name }}
+          BACKEND_APP: ${{ steps.vars.outputs.backend_app }}
+          BACKEND_IMAGE: ${{ steps.vars.outputs.backend_image }}
+          ACR_NAME: ${{ steps.vars.outputs.acr_name }}
+          ACR_USERNAME: ${{ steps.acrcreds.outputs.username }}
+          ACR_PASSWORD: ${{ steps.acrcreds.outputs.password }}
+        run: |
+          set -euo pipefail
+          SUBSCRIPTION_ID="$SUBSCRIPTION_ID_INPUT"
+          if [ -z "$SUBSCRIPTION_ID" ]; then
+            SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          fi
+          export SUBSCRIPTION_ID
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          env_id = (
+              f"/subscriptions/{os.environ['SUBSCRIPTION_ID']}"
+              f"/resourceGroups/{os.environ['RESOURCE_GROUP']}"
+              f"/providers/Microsoft.App/managedEnvironments/{os.environ['ACA_ENV_NAME']}"
+          )
+
+          doc = {
+              "location": os.environ["LOCATION"],
+              "name": os.environ["BACKEND_APP"],
+              "resourceGroup": os.environ["RESOURCE_GROUP"],
+              "type": "Microsoft.App/containerApps",
+              "properties": {
+                  "managedEnvironmentId": env_id,
+                  "configuration": {
+                      "activeRevisionsMode": "Single",
+                      "ingress": {
+                          "external": False,
+                          "targetPort": 8000,
+                          "transport": "auto"
+                      },
+                      "registries": [{
+                          "server": f"{os.environ['ACR_NAME']}.azurecr.io",
+                          "username": os.environ["ACR_USERNAME"],
+                          "passwordSecretRef": "acr-password"
+                      }],
+                      "secrets": [
+                          {"name": "acr-password", "value": os.environ["ACR_PASSWORD"]},
+                          {"name": "database-url", "value": os.environ["DATABASE_URL"]},
+                          {"name": "postgres-password", "value": os.environ["DB_PASSWORD"]},
+                          {"name": "secret-key", "value": os.environ["SECRET_KEY"]},
+                          {"name": "azure-openai-api-key", "value": os.environ["AZURE_OPENAI_API_KEY"]},
+                          {"name": "azure-openai-endpoint", "value": os.environ["AZURE_OPENAI_ENDPOINT"]},
+                          {"name": "azure-openai-deployment", "value": os.environ["AZURE_OPENAI_DEPLOYMENT"]},
+                          {"name": "azure-openai-api-version", "value": os.environ["AZURE_OPENAI_API_VERSION"]},
+                      ],
+                  },
+                  "template": {
+                      "containers": [
+                          {
+                              "name": "backend",
+                              "image": os.environ["BACKEND_IMAGE"],
+                              "env": [
+                                  {"name": "DATABASE_URL", "secretRef": "database-url"},
+                                  {"name": "SECRET_KEY", "secretRef": "secret-key"},
+                                  {"name": "POSTGRES_DB", "value": os.environ["DB_NAME"]},
+                                  {"name": "POSTGRES_USER", "value": os.environ["DB_USER"]},
+                                  {"name": "POSTGRES_PASSWORD", "secretRef": "postgres-password"},
+                                  {"name": "AZURE_OPENAI_API_KEY", "secretRef": "azure-openai-api-key"},
+                                  {"name": "AZURE_OPENAI_ENDPOINT", "secretRef": "azure-openai-endpoint"},
+                                  {"name": "AZURE_OPENAI_DEPLOYMENT", "secretRef": "azure-openai-deployment"},
+                                  {"name": "AZURE_OPENAI_API_VERSION", "secretRef": "azure-openai-api-version"},
+                                  {"name": "CORS_ORIGINS", "value": "*"},
+                              ],
+                              "probes": [
+                                  {
+                                      "type": "liveness",
+                                      "httpGet": {"path": "/health", "port": 8000},
+                                      "initialDelaySeconds": 30,
+                                      "periodSeconds": 30
+                                  },
+                                  {
+                                      "type": "readiness",
+                                      "httpGet": {"path": "/health", "port": 8000},
+                                      "initialDelaySeconds": 15,
+                                      "periodSeconds": 15
+                                  }
+                              ],
+                              "resources": {"cpu": 0.5, "memory": "1Gi"}
+                          },
+                          {
+                              "name": "postgres",
+                              "image": "postgres:16-alpine",
+                              "env": [
+                                  {"name": "POSTGRES_DB", "value": os.environ["DB_NAME"]},
+                                  {"name": "POSTGRES_USER", "value": os.environ["DB_USER"]},
+                                  {"name": "POSTGRES_PASSWORD", "secretRef": "postgres-password"},
+                                  {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
+                              ],
+                              "resources": {"cpu": 0.5, "memory": "1Gi"}
+                          }
+                      ],
+                      "scale": {"minReplicas": 1, "maxReplicas": 1}
+                  }
+              }
+          }
+
+          with open("backend-aca.yaml", "w", encoding="utf-8") as f:
+              json.dump(doc, f, indent=2)
+          PY
+
+      - name: Create or update backend app
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az containerapp show \
+            --name "${{ steps.vars.outputs.backend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null 2>&1; then
+            az containerapp update \
+              --name "${{ steps.vars.outputs.backend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml backend-aca.yaml
+          else
+            az containerapp create \
+              --name "${{ steps.vars.outputs.backend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml backend-aca.yaml
+          fi
+
+      - name: Read backend FQDN
+        id: backendfqdn
+        shell: bash
+        run: |
+          set -euo pipefail
+          BACKEND_FQDN=$(az containerapp show \
+            --name "${{ steps.vars.outputs.backend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
+          echo "fqdn=$BACKEND_FQDN" >> "$GITHUB_OUTPUT"
+
+      - name: Create frontend ACA definition
+        shell: bash
+        env:
+          SUBSCRIPTION_ID_INPUT: ${{ steps.vars.outputs.subscription_id }}
+          RESOURCE_GROUP: ${{ steps.vars.outputs.resource_group }}
+          LOCATION: ${{ steps.vars.outputs.location }}
+          ACA_ENV_NAME: ${{ steps.vars.outputs.aca_env_name }}
+          FRONTEND_APP: ${{ steps.vars.outputs.frontend_app }}
+          FRONTEND_IMAGE: ${{ steps.vars.outputs.frontend_image }}
+          ACR_NAME: ${{ steps.vars.outputs.acr_name }}
+          ACR_USERNAME: ${{ steps.acrcreds.outputs.username }}
+          ACR_PASSWORD: ${{ steps.acrcreds.outputs.password }}
+          BACKEND_FQDN: ${{ steps.backendfqdn.outputs.fqdn }}
+        run: |
+          set -euo pipefail
+          SUBSCRIPTION_ID="$SUBSCRIPTION_ID_INPUT"
+          if [ -z "$SUBSCRIPTION_ID" ]; then
+            SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          fi
+          export SUBSCRIPTION_ID
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          env_id = (
+              f"/subscriptions/{os.environ['SUBSCRIPTION_ID']}"
+              f"/resourceGroups/{os.environ['RESOURCE_GROUP']}"
+              f"/providers/Microsoft.App/managedEnvironments/{os.environ['ACA_ENV_NAME']}"
+          )
+          backend_fqdn = os.environ["BACKEND_FQDN"]
+
+          doc = {
+              "location": os.environ["LOCATION"],
+              "name": os.environ["FRONTEND_APP"],
+              "resourceGroup": os.environ["RESOURCE_GROUP"],
+              "type": "Microsoft.App/containerApps",
+              "properties": {
+                  "managedEnvironmentId": env_id,
+                  "configuration": {
+                      "activeRevisionsMode": "Single",
+                      "ingress": {
+                          "external": True,
+                          "targetPort": 80,
+                          "transport": "auto"
+                      },
+                      "registries": [{
+                          "server": f"{os.environ['ACR_NAME']}.azurecr.io",
+                          "username": os.environ["ACR_USERNAME"],
+                          "passwordSecretRef": "acr-password"
+                      }],
+                      "secrets": [
+                          {"name": "acr-password", "value": os.environ["ACR_PASSWORD"]}
+                      ]
+                  },
+                  "template": {
+                      "containers": [
+                          {
+                              "name": "frontend",
+                              "image": os.environ["FRONTEND_IMAGE"],
+                              "env": [
+                                  {"name": "BACKEND_ORIGIN", "value": f"https://{backend_fqdn}"},
+                                  {"name": "BACKEND_HOST", "value": backend_fqdn},
+                              ],
+                              "resources": {"cpu": 0.5, "memory": "1Gi"}
+                          }
+                      ],
+                      "scale": {"minReplicas": 1, "maxReplicas": 1}
+                  }
+              }
+          }
+
+          with open("frontend-aca.yaml", "w", encoding="utf-8") as f:
+              json.dump(doc, f, indent=2)
+          PY
+
+      - name: Create or update frontend app
+        shell: bash
+        run: |
+          set -euo pipefail
+          if az containerapp show \
+            --name "${{ steps.vars.outputs.frontend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null 2>&1; then
+            az containerapp update \
+              --name "${{ steps.vars.outputs.frontend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml frontend-aca.yaml
+          else
+            az containerapp create \
+              --name "${{ steps.vars.outputs.frontend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml frontend-aca.yaml
+          fi
+
+      - name: Read frontend FQDN
+        id: frontendfqdn
+        shell: bash
+        run: |
+          set -euo pipefail
+          FRONTEND_FQDN=$(az containerapp show \
+            --name "${{ steps.vars.outputs.frontend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
+          echo "fqdn=$FRONTEND_FQDN" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Deployment completed"
+          echo "Frontend: https://${{ steps.frontendfqdn.outputs.fqdn }}"
+          echo "Backend internal FQDN: ${{ steps.backendfqdn.outputs.fqdn }}"
+          echo "Backend image: ${{ steps.vars.outputs.backend_image }}"
+          echo "Frontend image: ${{ steps.vars.outputs.frontend_image }}"
