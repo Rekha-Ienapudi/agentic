@@ -1,0 +1,76 @@
+.card {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow-card);
+  border-left: 3px solid var(--color-primary);
+}
+
+.title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.summary {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--color-text-primary);
+  margin-bottom: 16px;
+}
+
+.metrics {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.metric {
+  background: #F8FAFF;
+  border: 1px solid var(--color-info-border);
+  border-radius: var(--radius-md);
+  padding: 8px 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 80px;
+}
+
+.metricValue {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--color-primary);
+  line-height: 1.2;
+}
+
+.metricValue.highlight {
+  color: var(--color-danger);
+}
+
+.metricLabel {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 2px;
+  text-align: center;
+}
+
+.recommendation {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+
+.recommendation strong {
+  color: var(--color-text-primary);
+  font-weight: 500;
+}

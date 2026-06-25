@@ -1,0 +1,14 @@
+.badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.critical { background: var(--color-danger-bg);  color: var(--color-danger-text); }
+.high     { background: var(--color-warning-bg); color: var(--color-warning-text); }
+.medium   { background: var(--color-info-bg);    color: var(--color-info-text); }
+.low      { background: #F3F4F6;                 color: #374151; }

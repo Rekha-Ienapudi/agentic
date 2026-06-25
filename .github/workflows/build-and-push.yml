@@ -1,0 +1,401 @@
+name: Build Push Deploy React + FastAPI to ACA
+
+on:
+  workflow_dispatch:
+    inputs:
+      acr_name:
+        description: "Azure Container Registry name"
+        required: false
+        default: "acrsupplyagenticdev"
+
+      resource_group:
+        description: "Azure Resource Group"
+        required: false
+        default: "rg-supply-agentic-dev"
+
+      location:
+        description: "Azure region"
+        required: false
+        default: "germanywestcentral"
+
+      aca_env_name:
+        description: "Container Apps Environment name"
+        required: false
+        default: "aca-supply-agentic-dev"
+
+      frontend_app_name:
+        description: "Frontend Container App name"
+        required: false
+        default: "ca-supply-frontend-dev"
+
+      backend_app_name:
+        description: "Backend Container App name"
+        required: false
+        default: "ca-supply-backend-dev"
+
+permissions:
+  contents: read
+
+env:
+  DEFAULT_ACR_NAME: ${{ vars.CONTAINER_REGISTRY }}
+  DEFAULT_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  DEFAULT_LOCATION: ${{ vars.AZURE_LOCATION }}
+  DEFAULT_ACA_ENV_NAME: ${{ vars.ACA_ENV_NAME }}
+  DEFAULT_FRONTEND_APP_NAME: ${{ vars.ACA_FRONTEND_APP_NAME }}
+  DEFAULT_BACKEND_APP_NAME: ${{ vars.ACA_BACKEND_APP_NAME }}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve variables
+        id: vars
+        shell: bash
+        run: |
+          ACR_NAME="${{ github.event.inputs.acr_name }}"
+          RESOURCE_GROUP="${{ github.event.inputs.resource_group }}"
+          LOCATION="${{ github.event.inputs.location }}"
+          ACA_ENV_NAME="${{ github.event.inputs.aca_env_name }}"
+          FRONTEND_APP="${{ github.event.inputs.frontend_app_name }}"
+          BACKEND_APP="${{ github.event.inputs.backend_app_name }}"
+
+          [ -z "$ACR_NAME" ] && ACR_NAME="$DEFAULT_ACR_NAME"
+          [ -z "$RESOURCE_GROUP" ] && RESOURCE_GROUP="$DEFAULT_RESOURCE_GROUP"
+          [ -z "$LOCATION" ] && LOCATION="$DEFAULT_LOCATION"
+          [ -z "$ACA_ENV_NAME" ] && ACA_ENV_NAME="$DEFAULT_ACA_ENV_NAME"
+          [ -z "$FRONTEND_APP" ] && FRONTEND_APP="$DEFAULT_FRONTEND_APP_NAME"
+          [ -z "$BACKEND_APP" ] && BACKEND_APP="$DEFAULT_BACKEND_APP_NAME"
+
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          IMAGE_TAG="v$(date +'%Y.%m.%d').${SHORT_SHA}"
+
+          BACKEND_IMAGE="$ACR_NAME.azurecr.io/backend:$IMAGE_TAG"
+          FRONTEND_IMAGE="$ACR_NAME.azurecr.io/frontend:$IMAGE_TAG"
+
+          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+          echo "resource_group=$RESOURCE_GROUP" >> $GITHUB_OUTPUT
+          echo "location=$LOCATION" >> $GITHUB_OUTPUT
+          echo "aca_env_name=$ACA_ENV_NAME" >> $GITHUB_OUTPUT
+          echo "frontend_app=$FRONTEND_APP" >> $GITHUB_OUTPUT
+          echo "backend_app=$BACKEND_APP" >> $GITHUB_OUTPUT
+          echo "backend_image=$BACKEND_IMAGE" >> $GITHUB_OUTPUT
+          echo "frontend_image=$FRONTEND_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Azure login with device code
+        shell: bash
+        run: |
+          az login --use-device-code
+
+      - name: Ensure ACA extension
+        shell: bash
+        run: |
+          az extension add --name containerapp --upgrade --allow-preview true
+          az provider register --namespace Microsoft.App
+          az provider register --namespace Microsoft.OperationalInsights
+          az provider register --namespace Microsoft.ContainerRegistry
+
+      - name: Ensure resource group
+        shell: bash
+        run: |
+          az group create \
+            --name "${{ steps.vars.outputs.resource_group }}" \
+            --location "${{ steps.vars.outputs.location }}"
+
+      - name: Ensure ACR exists
+        shell: bash
+        run: |
+          if ! az acr show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null 2>&1; then
+            az acr create \
+              --name "${{ steps.vars.outputs.acr_name }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --location "${{ steps.vars.outputs.location }}" \
+              --sku Basic \
+              --admin-enabled true
+          fi
+
+      - name: Ensure Log Analytics workspace exists
+        id: logs
+        shell: bash
+        run: |
+          LAW_NAME="${{ steps.vars.outputs.aca_env_name }}-logs"
+
+          if ! az monitor log-analytics workspace show \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --workspace-name "$LAW_NAME" >/dev/null 2>&1; then
+            az monitor log-analytics workspace create \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --workspace-name "$LAW_NAME" \
+              --location "${{ steps.vars.outputs.location }}"
+          fi
+
+          CUSTOMER_ID=$(az monitor log-analytics workspace show \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --workspace-name "$LAW_NAME" \
+            --query customerId -o tsv)
+
+          SHARED_KEY=$(az monitor log-analytics workspace get-shared-keys \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --workspace-name "$LAW_NAME" \
+            --query primarySharedKey -o tsv)
+
+          echo "law_name=$LAW_NAME" >> $GITHUB_OUTPUT
+          echo "customer_id=$CUSTOMER_ID" >> $GITHUB_OUTPUT
+          echo "shared_key=$SHARED_KEY" >> $GITHUB_OUTPUT
+
+      - name: Ensure ACA environment exists
+        shell: bash
+        run: |
+          if ! az containerapp env show \
+            --name "${{ steps.vars.outputs.aca_env_name }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null 2>&1; then
+            az containerapp env create \
+              --name "${{ steps.vars.outputs.aca_env_name }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --location "${{ steps.vars.outputs.location }}" \
+              --logs-workspace-id "${{ steps.logs.outputs.customer_id }}" \
+              --logs-workspace-key "${{ steps.logs.outputs.shared_key }}"
+          fi
+
+      - name: ACR login
+        shell: bash
+        run: |
+          az acr login --name "${{ steps.vars.outputs.acr_name }}"
+
+      - name: Build and push backend image
+        shell: bash
+        run: |
+          docker build -t "${{ steps.vars.outputs.backend_image }}" ./backend
+          docker push "${{ steps.vars.outputs.backend_image }}"
+
+      - name: Get ACR credentials for ACA pulls
+        id: acrcreds
+        shell: bash
+        run: |
+          ACR_USERNAME=$(az acr credential show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --query username -o tsv)
+
+          ACR_PASSWORD=$(az acr credential show \
+            --name "${{ steps.vars.outputs.acr_name }}" \
+            --query 'passwords[0].value' -o tsv)
+
+          echo "username=$ACR_USERNAME" >> $GITHUB_OUTPUT
+          echo "password=$ACR_PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Create backend ACA yaml
+        shell: bash
+        run: |
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+          cat > backend-aca.yaml <<EOF
+          location: ${{ steps.vars.outputs.location }}
+          name: ${{ steps.vars.outputs.backend_app }}
+          resourceGroup: ${{ steps.vars.outputs.resource_group }}
+          type: Microsoft.App/containerApps
+          properties:
+            managedEnvironmentId: /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${{ steps.vars.outputs.resource_group }}/providers/Microsoft.App/managedEnvironments/${{ steps.vars.outputs.aca_env_name }}
+            configuration:
+              ingress:
+                external: false
+                targetPort: 8000
+                transport: auto
+              registries:
+                - server: ${{ steps.vars.outputs.acr_name }}.azurecr.io
+                  username: ${{ steps.acrcreds.outputs.username }}
+                  passwordSecretRef: acr-password
+              secrets:
+                - name: acr-password
+                  value: ${{ steps.acrcreds.outputs.password }}
+                - name: postgres-password
+                  value: ${{ secrets.POSTGRES_PASSWORD }}
+                - name: secret-key
+                  value: ${{ secrets.SECRET_KEY }}
+                - name: azure-openai-api-key
+                  value: ${{ secrets.AZURE_OPENAI_API_KEY }}
+                - name: azure-openai-endpoint
+                  value: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+                - name: azure-openai-deployment
+                  value: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+                - name: azure-openai-api-version
+                  value: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+            template:
+              containers:
+                - name: backend
+                  image: ${{ steps.vars.outputs.backend_image }}
+                  env:
+                    - name: DATABASE_URL
+                      value: postgresql://${{ secrets.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@127.0.0.1:5432/${{ secrets.POSTGRES_DB }}
+                    - name: SECRET_KEY
+                      secretRef: secret-key
+                    - name: POSTGRES_DB
+                      value: ${{ secrets.POSTGRES_DB }}
+                    - name: POSTGRES_USER
+                      value: ${{ secrets.POSTGRES_USER }}
+                    - name: POSTGRES_PASSWORD
+                      secretRef: postgres-password
+                    - name: AZURE_OPENAI_API_KEY
+                      secretRef: azure-openai-api-key
+                    - name: AZURE_OPENAI_ENDPOINT
+                      secretRef: azure-openai-endpoint
+                    - name: AZURE_OPENAI_DEPLOYMENT
+                      secretRef: azure-openai-deployment
+                    - name: AZURE_OPENAI_API_VERSION
+                      secretRef: azure-openai-api-version
+                    - name: CORS_ORIGINS
+                      value: "*"
+                  probes:
+                    - type: liveness
+                      httpGet:
+                        path: /health
+                        port: 8000
+                      initialDelaySeconds: 20
+                      periodSeconds: 30
+                    - type: readiness
+                      httpGet:
+                        path: /health
+                        port: 8000
+                      initialDelaySeconds: 10
+                      periodSeconds: 15
+                  resources:
+                    cpu: 0.75
+                    memory: 1.5Gi
+
+                - name: postgres
+                  image: postgres:16-alpine
+                  env:
+                    - name: POSTGRES_DB
+                      value: ${{ secrets.POSTGRES_DB }}
+                    - name: POSTGRES_USER
+                      value: ${{ secrets.POSTGRES_USER }}
+                    - name: POSTGRES_PASSWORD
+                      secretRef: postgres-password
+                    - name: PGDATA
+                      value: /var/lib/postgresql/data/pgdata
+                  resources:
+                    cpu: 0.5
+                    memory: 1Gi
+
+              scale:
+                minReplicas: 1
+                maxReplicas: 1
+          EOF
+
+      - name: Create or update backend app
+        shell: bash
+        run: |
+          if az containerapp show \
+            --name "${{ steps.vars.outputs.backend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null 2>&1; then
+            az containerapp update \
+              --name "${{ steps.vars.outputs.backend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml backend-aca.yaml
+          else
+            az containerapp create \
+              --name "${{ steps.vars.outputs.backend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml backend-aca.yaml
+          fi
+
+      - name: Read backend FQDN
+        id: backendfqdn
+        shell: bash
+        run: |
+          BACKEND_FQDN=$(az containerapp show \
+            --name "${{ steps.vars.outputs.backend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
+          echo "fqdn=$BACKEND_FQDN" >> $GITHUB_OUTPUT
+
+      - name: Build and push frontend image
+        shell: bash
+        run: |
+          docker build \
+            --build-arg VITE_API_URL="[${{](https://${{) steps.backendfqdn.outputs.fqdn }}" \
+            -t "${{ steps.vars.outputs.frontend_image }}" \
+            ./frontend
+          docker push "${{ steps.vars.outputs.frontend_image }}"
+
+      - name: Create frontend ACA yaml
+        shell: bash
+        run: |
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+          cat > frontend-aca.yaml <<EOF
+          location: ${{ steps.vars.outputs.location }}
+          name: ${{ steps.vars.outputs.frontend_app }}
+          resourceGroup: ${{ steps.vars.outputs.resource_group }}
+          type: Microsoft.App/containerApps
+          properties:
+            managedEnvironmentId: /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${{ steps.vars.outputs.resource_group }}/providers/Microsoft.App/managedEnvironments/${{ steps.vars.outputs.aca_env_name }}
+            configuration:
+              ingress:
+                external: true
+                targetPort: 80
+                transport: auto
+              registries:
+                - server: ${{ steps.vars.outputs.acr_name }}.azurecr.io
+                  username: ${{ steps.acrcreds.outputs.username }}
+                  passwordSecretRef: acr-password
+              secrets:
+                - name: acr-password
+                  value: ${{ steps.acrcreds.outputs.password }}
+            template:
+              containers:
+                - name: frontend
+                  image: ${{ steps.vars.outputs.frontend_image }}
+                  resources:
+                    cpu: 0.5
+                    memory: 512Mi
+              scale:
+                minReplicas: 1
+                maxReplicas: 1
+          EOF
+
+      - name: Create or update frontend app
+        shell: bash
+        run: |
+          if az containerapp show \
+            --name "${{ steps.vars.outputs.frontend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" >/dev/null 2>&1; then
+            az containerapp update \
+              --name "${{ steps.vars.outputs.frontend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml frontend-aca.yaml
+          else
+            az containerapp create \
+              --name "${{ steps.vars.outputs.frontend_app }}" \
+              --resource-group "${{ steps.vars.outputs.resource_group }}" \
+              --yaml frontend-aca.yaml
+          fi
+
+      - name: Read frontend FQDN
+        id: frontendfqdn
+        shell: bash
+        run: |
+          FRONTEND_FQDN=$(az containerapp show \
+            --name "${{ steps.vars.outputs.frontend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
+          echo "fqdn=$FRONTEND_FQDN" >> $GITHUB_OUTPUT
+
+      - name: Update backend CORS for frontend URL
+        shell: bash
+        run: |
+          az containerapp update \
+            --name "${{ steps.vars.outputs.backend_app }}" \
+            --resource-group "${{ steps.vars.outputs.resource_group }}" \
+            --set-env-vars CORS_ORIGINS="[${{](https://${{) steps.frontendfqdn.outputs.fqdn }}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Frontend: [${{](https://${{) steps.frontendfqdn.outputs.fqdn }}"
+          echo "Backend internal FQDN: ${{ steps.backendfqdn.outputs.fqdn }}"
